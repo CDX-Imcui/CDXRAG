@@ -1,0 +1,15 @@
+/figures/*
+/offline_data_ingestion_and_query_interface/data/schema/*
+/offline_data_ingestion_and_query_interface/dataset/hybridqa/dev_excel/*
+
+/online_inference/__pycache__/*
+/online_inference/data/dev_doc/*
+/online_inference/data/dev_excel/*
+/online_inference/evaluation/evaluation.xlsx
+/online_inference/models/bge-m3/*
+/online_inference/models/bge-reranker-v2-m3/*
+/online_inference/models/DeBERTa-v3-large-mnli-fever-anli-ling-wanli/*
+/online_inference/embedding.pkl
+
+/offline_data_ingestion_and_query_interface/src/app.log
+/online_inference/output.json

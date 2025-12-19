@@ -1,0 +1,41 @@
+下载好的文件 ollama-linux-amd64.tgz
+# 删除所有 Ollama 相关文件
+sudo rm -rf /usr/bin/ollama
+sudo rm -rf /usr/local/bin/ollama
+sudo rm -rf ~/.ollama
+sudo rm -rf /opt/ollama
+# 清理临时文件
+sudo rm -rf /tmp/ollama*
+sudo tar -xzf ollama-linux-amd64.tgz -C /usr
+
+
+tmux new -s ollama
+export CUDA_VISIBLE_DEVICES=0,1
+# 开启跨卡均衡调度      export OLLAMA_SCHED_SPREAD=1
+频繁重载 30B 很浪费时间 export OLLAMA_KEEP_ALIVE=5min
+ollama serve
+ollama -v
+ollama pull qwen2.5:7b
+ollama run gpt-oss:120b-cloud
+ollama list
+ollama rm qwen3:30b
+http://localhost:11434/v1
+https://ollama.com
+OLLAMA_API_KEY=6ff92b985bd24852acdbb7484e78616a.BqPH6uadbBG0HlLNN3xRQGAK
+
+tmux new -s interface
+conda activate TableRAG
+cd offline_data_ingestion_and_query_interface/src/
+export CUDA_VISIBLE_DEVICES=3
+python interface.py --backbone qwen2.5:32b
+
+
+tmux new -s main
+export CUDA_VISIBLE_DEVICES=3
+conda activate TableRAG
+cd ~/workspace/TableRAG/online_inference
+ python main.py   --backbone qwen2.5:32b  --data_file_path ./data/my_dev.json  --doc_dir ./data/dev_doc  --excel_dir ./data/dev_excel --bge_dir ./models --save_file_path ./output.json
+ python main.py   --backbone qwen2.5:72b  --data_file_path ./data/my_dev.json  --doc_dir ./data/dev_doc  --excel_dir ./data/dev_excel --bge_dir ./models --save_file_path ./output.json
+
+ollama ps
+tmux attach -t main
