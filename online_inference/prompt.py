@@ -21,31 +21,61 @@ User Input Query: {query}
 Please start!
 """
 
-COMBINE_PROMPT = """You are about to complete a table-based question answernig task using the following two types of reference materials:
+COMBINE_PROMPT = """You are an expert Data Analyst. You have two evidence sources to answer the user's question.
 
-# Content 1: Original content (table content is provided in Markdown format):
-{docs}
+# SOURCE 1: Structured Knowledge (Semantic Retrieval)
+**Guidance**: {guidance}
 
-$ Content 2: NL2SQL related Question information and SQL execution result in the database:
-# the user given table schema
-{schema}
+### A. Table Segment (with Reference IDs):
+{final_table_md}
 
-# SQL generated based on the schema and the user question:
-{nl2sql_model_response}
+### B. Textual Evidence (Aligned & Pruned):
+{pruned_text_str}
 
-# SQL execution results
-{sql_execute_result}
+# SOURCE 2: Database Query (Symbolic Calculation)
+**Schema**: {schema}
+**Generated SQL**: {nl2sql_model_response}
+**SQL Result**: {sql_execute_result}
 
-Please answer the user's question based on the materials above.
-User question: {query}
+---
+**User Question**: {query}
 
-Note:
-1. The markdown table content in Content 1 may be incomplete.
-2. You should cross-validate the given two materials:
-    - if the answers are the same, directly output the answer.
-    - if the "SQL execution result" contains error or is empty, you should try to answer based on the Content 1.
-    - if the two materials shows conflit, you should think about each of them, and finally give an answer.
+**Reasoning Strategy**:
+1. **Hybrid Verification**: 
+   - Use **Source 1** for understanding context, specific attributes, and entity relationships.
+   - Use **Source 2** (SQL) specifically for counting, ranking, or aggregation tasks (e.g., "how many", "top 3").
+2. **Conflict Resolution**:
+   - If SQL returns an error or empty result, rely entirely on Source 1.
+   - If Source 1 and Source 2 contradict, prioritize the one that provides more specific evidence (e.g., a specific date vs. a generic flag).
+
+Please output the answer directly.
 """
+#
+# COMBINE_PROMPT = """You are about to complete a table-based question answernig task using the following two types of reference materials:
+#
+# # Content 1: Original content (table content is provided in Markdown format):
+# {docs}
+#
+# $ Content 2: NL2SQL related Question information and SQL execution result in the database:
+# # the user given table schema
+# {schema}
+#
+# # SQL generated based on the schema and the user question:
+# {nl2sql_model_response}
+#
+# # SQL execution results
+# {sql_execute_result}
+#
+# Please answer the user's question based on the materials above.
+# User question: {query}
+#
+# Note:
+# 1. The markdown table content in Content 1 may be incomplete.
+# 2. You should cross-validate the given two materials:
+#     - if the answers are the same, directly output the answer.
+#     - if the "SQL execution result" contains error or is empty, you should try to answer based on the Content 1.
+#     - if the two materials shows conflit, you should think about each of them, and finally give an answer.
+# """
 
 EVALUATION_PRONPT = """We would like to request your feedback on the performance of the AI assistant in response to the user question displayed above according to the gold answer. Please use the following listed aspects and their descriptions as evaluation criteria:
     - Accuracy and Hallucinations: The assistant's answer is semantically consistent with the gold answer; The numerical value and order need to be accurate, and there should be no hallucinations.

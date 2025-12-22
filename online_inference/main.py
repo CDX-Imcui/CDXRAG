@@ -46,7 +46,7 @@ class TableRAG():
         # self.repo_id = self.config.get("repo_id", "")
         self.function_lock = threading.Lock()
         # Pipeline 缓存池：Key=TableFileName, Value=TableRAGPipeline实例,避免同一个表格重复 build_index
-        self.pipeline_cache: Dict[str, TableRAGPipeline] = {}
+        # self.pipeline_cache: Dict[str, TableRAGPipeline] = {}
 
     def relate_to_table(self, doc_name: str) -> str:
         """
@@ -131,8 +131,8 @@ class TableRAG():
         """
         [核心集成点] 工厂方法：获取或创建对应表格的 Pipeline 实例
         """
-        if table_name_stem in self.pipeline_cache:
-            return self.pipeline_cache[table_name_stem]
+        # if table_name_stem in self.pipeline_cache:
+        #     return self.pipeline_cache[table_name_stem]
 
         logger.info(f"⚙️ Initializing new TableRAGPipeline for: {table_name_stem}")
 
@@ -157,7 +157,7 @@ class TableRAG():
             pipeline.build_index()
 
             # 4. 存入缓存
-            self.pipeline_cache[table_name_stem] = pipeline
+            # self.pipeline_cache[table_name_stem] = pipeline
             return pipeline
 
         except Exception as e:
@@ -178,7 +178,6 @@ class TableRAG():
         top1_table_name = doc_filenaems[0].replace(".json", "").replace(".xlsx", "")
         # [核心集成点 1] 此时初始化 Pipeline，创建一个已经“理解”了该表格和对应文本的智能体
         current_pipeline = self.get_or_create_pipeline(top1_table_name)
-        # TODO 多表
         related_table_name_list = [top1_table_name]
 
         tools = self.create_tools()
@@ -214,9 +213,19 @@ class TableRAG():
 
             for sub_query, tool_call_id in zip(sub_queries, tool_call_ids):
                 # Step 2: 混合执行。针对每个子问题跑 ExcelRAG 和 SQL
-                reranked_docs, _, _ = self.retriever.retrieve(sub_query, 30, 5)
-                unique_retrieved_docs = list(dict.fromkeys(reranked_docs))
-                doc_content = "\n".join(unique_retrieved_docs[:3])
+                # reranked_docs, _, _ = self.retriever.retrieve(sub_query, 30, 5)
+                # unique_retrieved_docs = list(dict.fromkeys(reranked_docs))
+                # doc_content = "\n".join(unique_retrieved_docs[:3])
+
+                # --- 1. 获取高质量上下文 (替代原有的 MixedDocRetriever) ---
+                # 这里拿到的 docs 不再是散乱的文本，而是“表+文”对齐好的结构化信息
+                try:
+                    guidance, final_table_md, pruned_text_str = current_pipeline.retrieve_aligned_context(sub_query)
+                except Exception as e:
+                    logger.error(f"Pipeline Context Failed: {e}")
+                    guidance = "Error in retrieval."
+                    final_table_md = "Table context unavailable."
+                    pruned_text_str = ""
 
                 excel_rag_response_dict = get_excel_rag_response_plain(related_table_name_list, sub_query)
                 excel_rag_response = copy.deepcopy(excel_rag_response_dict)
@@ -231,28 +240,18 @@ class TableRAG():
                 except:
                     sql_str, sql_execute_result, schema = "ExcelRAG execute fails, key does not exists."
 
-                # try:
-                #     # [核心集成点 2] ！！！这里替换掉了原来的 ExcelRAG/SQL/Combine 逻辑！！！
-                #     # 直接调用 Pipeline 的 query 方法
-                #     # 这里会触发：Pruning -> Alignment -> Bi-directional Ref -> Hybrid Prompt
-                #     pipeline_answer = current_pipeline.query(sub_query)
-                #
-                #     # 清洗一下答案，去掉 <Answer> 标签，只保留内容供 Agent 参考
-                #     clean_answer = pipeline_answer.replace("<Answer>:", "").strip()
-                #     answer = f"Subquery Answer from Data: {clean_answer}"
-                # except Exception as e:
-                #     logger.error(f"Pipeline Query Failed: {e}")
-                #     answer = f"Error querying data: {str(e)}"
 
                 # Step 3: 信息融合。使用 COMBINE_PROMPT 将上述检索到的 Docs + SQL Result + Schema 拼接在一起，调用LLM生成一个“Subquery Answer”
                 combine_prompt_formatted = COMBINE_PROMPT.format(
-                    docs=doc_content,
+                    guidance=guidance,  # 填入引导语
+                    final_table_md=final_table_md,  # 填入带引用的表格
+                    pruned_text_str=pruned_text_str,  # 填入对齐后的文本
                     schema=schema,
                     nl2sql_model_response=sql_str,
                     sql_execute_result=sql_execute_result,
                     query=sub_query
                 )
-
+                print(f"--- Table ---\n{final_table_md}\n--- Text ---\n{pruned_text_str}\n")
                 msg = [{"role": "user", "content": combine_prompt_formatted}]
                 answer = self.get_llm_response(text_messages=msg, backbone=backbone, select_config=select_config,
                                                tools=None)

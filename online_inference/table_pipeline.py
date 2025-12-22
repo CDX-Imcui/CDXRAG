@@ -7,14 +7,15 @@ import torch.nn.functional as F
 from typing import List, Dict, Any, Tuple
 from tqdm import tqdm
 import math
-
+import re
+from difflib import get_close_matches
 from chat_utils import get_chat_result
 from config import config_mapping
 from utils.tool_utils import Embedder
-from transformers import pipeline as hf_pipeline, AutoTokenizer, AutoModelForSequenceClassification
 import time
 from contextlib import contextmanager
-
+from collections import Counter
+import math
 
 @contextmanager
 def timer(name):
@@ -58,11 +59,11 @@ class TableRAGPipeline:
         self.pk_col = self.df.columns[0]  # 默认第一列为主键
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.nli_model_name = "models/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"
-        self.nli_tokenizer = AutoTokenizer.from_pretrained(self.nli_model_name)
-        self.nli_model = AutoModelForSequenceClassification.from_pretrained(self.nli_model_name).to(self.device)
-        self.nli_model.eval()  # 务必开启 eval 模式，关闭 Dropout
-        self.nli_labels = ["entailment", "neutral", "contradiction"]
+        # self.nli_model_name = "models/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"
+        # self.nli_tokenizer = AutoTokenizer.from_pretrained(self.nli_model_name)
+        # self.nli_model = AutoModelForSequenceClassification.from_pretrained(self.nli_model_name).to(self.device)
+        # self.nli_model.eval()  # 务必开启 eval 模式，关闭 Dropout
+        # self.nli_labels = ["entailment", "neutral", "contradiction"]
 
     def _clean_json_response(self, content: str) -> Dict:
         """Helper: 鲁棒的 JSON 提取器"""
@@ -111,6 +112,50 @@ Output JSON only:
         )
         return self._clean_json_response(response.content)
 
+    def _smart_format(self, template: str, row_dict: Dict) -> str:
+        """
+        填充器：允许 LLM 稍微写错列名，代码负责自动纠正。
+        """
+        # 1. 找出模板里所有需要的 {Key}
+        # 比如模板是 "{Browser} uses {Engine}." -> 提取出 ['Browser', 'Engine']
+        needed_keys = re.findall(r'\{(.+?)\}', template)
+
+        # 2. 准备实际的数据池
+        actual_keys = list(row_dict.keys())
+        # 创建一个归一化映射 (全小写 -> 真实Key)
+        lower_map = {k.lower().strip(): k for k in actual_keys}
+
+        # 3. 构建最终的填充字典
+        final_mapping = {}
+
+        for placeholder in needed_keys:
+            # Case A: 完全匹配 (最完美)
+            if placeholder in row_dict:
+                final_mapping[placeholder] = row_dict[placeholder]
+                continue
+
+            # Case B: 忽略大小写和空格匹配
+            clean_placeholder = placeholder.lower().strip()
+            if clean_placeholder in lower_map:
+                real_key = lower_map[clean_placeholder]
+                final_mapping[placeholder] = row_dict[real_key]
+                continue
+
+            # Case C: 模糊匹配 (difflib)
+            # 比如 LLM 写了 {Layout}，实际是 {Current layout engine}
+            # cutoff=0.6 表示只要有 60% 像就可以
+            matches = get_close_matches(placeholder, actual_keys, n=1, cutoff=0.6)
+            if matches:
+                real_key = matches[0]
+                final_mapping[placeholder] = row_dict[real_key]
+                # print(f"🔧 Auto-fixed: {{{placeholder}}} -> '{real_key}'") # 调试用
+            else:
+                # Case D: 实在找不到，填个默认值，保证不崩
+                final_mapping[placeholder] = "Unknown"
+
+        # 4. 安全填充
+        return template.format(**final_mapping)
+
     def build_index(self):
         """核心流程：执行离线建库"""
         print("\n=== 🏗️ Phase 1: Building Offline Index ===")
@@ -128,7 +173,8 @@ Output JSON only:
         for idx, row in tqdm(self.df.iterrows(), total=len(self.df), desc="Rows to Docs"):
             row_dict = row.to_dict()
             try:
-                text = py_template.format(**row_dict)
+                # 使用智能模糊填充，而不是死板的 format
+                text = self._smart_format(py_template, row_dict)
                 self.documents.append({
                     "row_id": idx,
                     "text": text,
@@ -144,12 +190,12 @@ Output JSON only:
             raise ValueError("❌ No texts generated from table! Check your template keys against dataframe columns.")
         raw_emb = torch.tensor(self.embedder.encode(table_texts))
         # 手动进行 L2 归一化 (p=2, dim=1)
-        self.table_embeddings = F.normalize(raw_emb, p=2, dim=1)
+        self.table_embeddings = F.normalize(raw_emb, p=2, dim=1).cpu()
 
         # 对外部文本列表进行向量化
         if self.raw_text_list and len(self.raw_text_list) > 0:
             print(f"⚡ Encoding {len(self.raw_text_list)} External Text Blocks...")
-            self.text_embeddings = F.normalize(torch.tensor(self.embedder.encode(self.raw_text_list)), p=2, dim=1)
+            self.text_embeddings = F.normalize(torch.tensor(self.embedder.encode(self.raw_text_list)), p=2, dim=1).cpu()
         else:
             print("⚠️ Warning: external_text_list is empty, text indexing skipped.")
 
@@ -211,53 +257,73 @@ Output JSON only:
         )
 
         result = self._clean_json_response(response.content)
+        # 1. 获取 LLM 想要保留的列
+        selected = result.get("selected_columns", [])
+        # 2. [关键修复] 强制注入 Primary Key (self.pk_col)
+        # 无论 LLM 觉得需不需要，程序逻辑需要它
+        if self.pk_col not in selected:
+            # print(f"🔧 Auto-injecting PK column: {self.pk_col}")
+            selected.insert(0, self.pk_col)
 
-        # 校验选出的列是否真的在表中
-        result["selected_columns"] = [c for c in result.get("selected_columns", []) if c in all_cols]
-        if not result["selected_columns"]:
-            result["selected_columns"] = all_cols
+        # 3. 校验选出的列是否真的在表中
+        final_selected = [c for c in selected if c in all_cols]
+        if not final_selected:
+            final_selected = all_cols
 
         print(f"🏷️ answer_in_table: {result['answer_in_table']}")
         print(f"💡 Reasoning: {result['reasoning']}")
-
+        result["selected_columns"] = final_selected
         return result
 
-    def _analyze_query_intent(self, question: str) -> Dict[str, bool]:
+    def _analyze_query_intent(self, question: str) -> str:
         """
         分析问题意图：是简单的查值，还是复杂的聚合/排序
         """
-        signals = {
-            "is_complex": False,
-            "has_agg": any(w in question.lower() for w in ["how many", "sum", "average", "total", "percentage"]),
-            "has_rank": any(w in question.lower() for w in ["most", "highest", "second", "rank", "top", "compare"])
-        }
-        if signals["has_agg"] or signals["has_rank"]:
-            signals["is_complex"] = True
-        return signals
+        q_lower = question.lower()
 
-    def _expand_context_radius(self, anchor_ids: List[int], intent: Dict[str, bool]) -> List[int]:
+        # 1. 聚合类关键词 (Aggregation)
+        agg_keywords = ["how many", "sum", "average", "total", "percentage", "count", "amount"]
+        if any(w in q_lower for w in agg_keywords):
+            return "aggregation"
+
+        # 2. 排序/比较类关键词 (Ranking)
+        # 注意：包含 'second', 'most', 'top' 等
+        rank_keywords = ["most", "least", "best", "worst", "top", "first", "second",
+                         "third", "last", "rank", "sort", "highest", "lowest", "compare"]
+        if any(w in q_lower for w in rank_keywords):
+            return "ranking"
+
+        # 3. 默认查值 (Retrieval)
+        return "retrieval"
+
+    def _expand_context_radius(self, anchor_ids: List[int], intent: str) -> List[int]:
         """
-        根据意图和分布情况，自适应分配上下文预算
+        根据意图自适应分配上下文行。
+        intent: "retrieval" | "ranking" | "aggregation"
         """
         final_ids = set(anchor_ids)
 
-        # 只要意图是简单的（查值），就强制走 Compact 策略，忽略分布离散度 (std_dist)
-        # 只有当问题确实需要聚合/比较 (is_complex=True) 时，才考虑属性扩展
-        if not intent["is_complex"]:
+        # === 场景 A: 简单查值 (Retrieval) ===
+        # 策略：关注局部上下文
+        # 逻辑：加上前后邻居，帮助理解上下文衔接
+        if intent == "retrieval":
             for rid in anchor_ids:
                 if rid > 0: final_ids.add(rid - 1)
                 if rid < len(self.df) - 1: final_ids.add(rid + 1)
 
-        # 复杂型 (聚合/排序) -> 属性共享扩展
+        # === 场景 B: 排名或聚合 (Ranking / Aggregation) ===
         else:
-            for rid in anchor_ids:
-                shared_val = self.df.iloc[rid].get('Current layout engine', '')
-                if shared_val and shared_val != 'Unknown':
-                    shared_rows = self.df[self.df['Current layout engine'] == shared_val].index.tolist()
-                    final_ids.update(shared_rows)
+            # 1. 强制加入 Top-10 行
+            top_n_count = 10
+            for i in range(min(top_n_count, len(self.df))):
+                final_ids.add(i)
 
+        # === 最终处理 ===
         sorted_ids = sorted(list(final_ids))
-        return sorted_ids[:15]
+        # 动态截断：如果是 Ranking 问题，尽量多给几行，防止榜单断裂
+        limit = 25 if intent in ["ranking", "aggregation"] else 15
+
+        return sorted_ids[:limit]
 
     # =========================================================================
     # 文本侧精简 (Textual Pruning - KV Focused)
@@ -268,7 +334,6 @@ Output JSON only:
         """
         2. 自动判定 KV 结构与句子结构
         3. 基于 BGE 相似度与实体锚定打分
-        4. 动态保留前 50% 的高价值信息单元
         """
         if not retrieved_texts: return []
 
@@ -315,78 +380,104 @@ Output JSON only:
 
         # 保留前 50%
         all_units.sort(key=lambda x: x["score"], reverse=True)
-        keep_count = min(20, math.ceil(len(all_units) * 0.5))  # 稍微放宽一点上限到20，保证上下文
+        keep_count = min(80, math.ceil(len(all_units) * 0.5))  # 稍微放宽一点上限到，保证上下文
 
         return all_units[:keep_count]
 
     def _inject_cross_references(self, sub_df: pd.DataFrame, pruned_units: List[Dict]) -> Dict[str, str]:
         """
-        核心功能：建立双向引用 (Bi-directional Reference)
-        1. Table -> Text: 在表格中添加文本 ID 和相似度 (Top-5)。
-        2. Text -> Table: 在文本前标记它属于哪些实体 (Multi-label)。
-        利用 Pruning 阶段产生的单元向量，计算表格行与文本单元的引用关系。
+        核心功能：通用混合检索对齐 (Robust Hybrid Alignment)
+        不再使用硬阈值保送，而是使用加权融合。引入 IDF 思想,关键词匹配不能“命中一个就给满分”。命中稀有词（如 "Android"）给高分，命中普通词给低分。
         """
         if not pruned_units:
             return {"table_md": sub_df.to_markdown(index=False), "text_str": ""}
 
-        # 1. 准备数据
-        # 提取单元向量堆叠成矩阵 [M, Dim]
-        unit_embs = torch.stack([u['embedding'] for u in pruned_units])
+        # 1. [新增] 动态计算表格内的 IDF (词的稀缺度)
+        all_tokens_flat = []
+        for val in sub_df[self.pk_col]:
+            # 简单分词，过滤短词
+            tokens = [w.lower() for w in re.split(r'\W+', str(val)) if len(w) > 2]
+            all_tokens_flat.extend(tokens)
 
-        # 提取子表行向量 [K, Dim]
+        token_counts = Counter(all_tokens_flat)
+        total_rows = len(sub_df)
+
+        # 计算每个词的 IDF 权重: log(总行数 / (词频 + 1)) + 1
+        # 稀有词权重高，高频词(如 Browser)权重低
+        idf_weights = {}
+        for token, count in token_counts.items():
+            idf_weights[token] = math.log(total_rows / (count + 1)) + 1.0
+
+        # 2. 准备向量
+        # 确保都在 CPU 上计算
+        unit_embs = torch.stack([u['embedding'] for u in pruned_units]).cpu()
         row_indices = sub_df.index.tolist()
-        row_embs = self.table_embeddings[row_indices]  # 注意：table_embeddings 最好在 build_index 里已经归一化
+        row_embs = self.table_embeddings[row_indices].cpu()
 
-        # 2. 计算相似度矩阵 [K, M]
-        sim_matrix = torch.matmul(row_embs, unit_embs.t())
+        # [K, M] 向量相似度矩阵
+        dense_scores = torch.matmul(row_embs, unit_embs.t()).numpy()
 
-        # 3. 双向打标容器
-        row_refs = {i: [] for i in range(len(sub_df))}  # 表格行 -> 引用ID
-        unit_labels = {j: set() for j in range(len(pruned_units))}  # 文本单元 -> 实体名
+        # 3. 容器
+        row_refs = {i: [] for i in range(len(sub_df))}
+        unit_labels = {j: set() for j in range(len(pruned_units))}
 
-        # 4. 遍历表格行，寻找匹配的文本单元
+        # 4. 混合检索循环
         for r_idx in range(len(sub_df)):
             row_entity = str(sub_df.iloc[r_idx][self.pk_col])
-            ent_keywords = {w.lower() for w in re.split(r'\W+', row_entity) if len(w) > 3}
+            # 提取当前行的实体 tokens
+            row_tokens = [w.lower() for w in re.split(r'\W+', row_entity) if len(w) > 2]
 
-            scores = sim_matrix[r_idx]
+            candidates = []
 
-            # 这里的阈值可以稍低，因为 Pruning 阶段已经筛选过一轮了
-            # 找出 Top-5 且分数 > 0.45 的单元
-            top_k_indices = torch.nonzero(scores > 0.45).squeeze()
-            if top_k_indices.dim() == 0 and top_k_indices.item() is None: continue
-            if top_k_indices.dim() == 0:
-                top_k_indices = [top_k_indices.item()]
-            else:
-                top_k_indices = top_k_indices.tolist()
+            for u_idx in range(len(pruned_units)):
+                # A. 稠密分 (Dense Score): 范围通常 -1 ~ 1
+                d_score = dense_scores[r_idx][u_idx]
 
-            # 按分数排序取 Top 5
-            top_k_pairs = sorted([(scores[i].item(), i) for i in top_k_indices], key=lambda x: x[0], reverse=True)[:5]
+                # B. 稀疏分 (Sparse Score): 基于 IDF 加权
+                text_content = pruned_units[u_idx]['text'].lower()
 
-            for score, u_idx in top_k_pairs:
-                text_content = pruned_units[u_idx]['text']
+                s_score = 0.0
+                for token in row_tokens:
+                    if token in text_content:
+                        # 命中稀有词加分多，命中高频词加分少
+                        s_score += idf_weights.get(token, 1.0)
 
-                # 双重校验：要么分数极高，要么包含实体关键词
-                is_keyword_match = any(kw in text_content.lower() for kw in ent_keywords)
-                is_high_conf = score > 0.75
+                # 归一化 Sparse Score (防止长实体分数无限膨胀)
+                # 假设匹配了 2-3 个核心词就算很高了，封顶 1.0
+                s_score = min(s_score / 4.0, 1.0)
 
-                if is_keyword_match or is_high_conf:
-                    # 表格侧记录: [0](0.82)
-                    row_refs[r_idx].append(f"[{u_idx}]({score:.2f})")
-                    # 文本侧记录: Android browser
+                # C. 融合分 (Hybrid Score)
+                # 0.7 * 向量 + 0.3 * 关键词
+                final_score = 0.7 * d_score + 0.3 * s_score
+
+                # [核心修复] 这里必须 Append 3个值，对应后面解包的 3个变量
+                candidates.append((final_score, u_idx, d_score))
+
+            # 5. 排序与截断
+            # 按 final_score 降序排列
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            top_k = candidates[:5]
+
+            # 6. 最终安全网 (Soft Threshold)
+            # 这里解包 3 个值就不会报错了
+            for f_score, u_idx, raw_score in top_k:
+                # 只要混合分 > 0.45 就可以入选
+                # 或者：虽然混合分略低，但原始向量分极高 (>0.65) 也可以入选
+                if f_score > 0.45 or raw_score > 0.65:
+                    # 记录时展示混合分数，方便调试
+                    row_refs[r_idx].append(f"[{u_idx}]({f_score:.2f})")
                     unit_labels[u_idx].add(row_entity)
 
-        # 5. 生成增强版表格
+        # 7. 生成增强版表格
         view_df = sub_df.copy()
         view_df["Related Context IDs"] = [", ".join(refs) for refs in row_refs.values()]
         table_md = view_df.to_markdown(index=False)
 
-        # 6. 生成增强版文本串
+        # 8. 生成增强版文本串
         formatted_texts = []
         for i, unit in enumerate(pruned_units):
             labels = sorted(list(unit_labels[i]))
             label_str = f"[Rel: {', '.join(labels)}]" if labels else ""
-            # 格式: [0] [Rel: Android] The text content...
             formatted_texts.append(f"[{i}] {label_str} {unit['text']}")
 
         return {
@@ -394,59 +485,59 @@ Output JSON only:
             "text_str": "\n".join(formatted_texts)
         }
 
-    def _verify_evidence(self, sub_table_facts: List[str], text_evidence: str) -> List[str]:
-        """
-        利用 Tokenizer 的 Batch 处理能力，一次性校验所有表格事实
-        """
-        if not text_evidence or not sub_table_facts:
-            return []
-
-        verification_signals = []
-        # 将文本证据作为统一的前提 (Premise)
-        premise = text_evidence[:1500]
-
-        try:
-            entail_idx = self.nli_labels.index("entailment")
-            contra_idx = self.nli_labels.index("contradiction")
-        except ValueError:
-            # 兜底逻辑：如果 labels 设置不对，默认使用官方标准 0, 2
-            entail_idx, contra_idx = 0, 2
-
-        # 1. 构造 Batch 输入对：[[Premise, Hypo1], [Premise, Hypo2], ...]
-        pairs = [[premise, fact] for fact in sub_table_facts]
-
-        # 2. 调用 Tokenizer 的批处理功能
-        # padding=True 会自动对齐长度，return_tensors="pt" 返回 PyTorch 张量
-        inputs = self.nli_tokenizer(
-            pairs,
-            padding=True,
-            truncation=True,
-            max_length=512,
-            return_tensors="pt"
-        ).to(self.device)
-
-        # 3. 开启无梯度推理模式
-        with torch.no_grad():
-            outputs = self.nli_model(**inputs)
-            # 对 logits 在最后一个维度（标签维度）做 Softmax，得到概率分布 [Batch_size, 3]
-            predictions = torch.softmax(outputs.logits, dim=-1)
-
-        # 4. 解析结果 (对应官方标签顺序: entailment, neutral, contradiction)
-        # 将结果转回 CPU 列表处理
-        predictions = predictions.cpu().numpy()
-
-        for i, probs in enumerate(predictions):
-            fact = sub_table_facts[i]
-            entail_prob = probs[entail_idx]
-            contra_prob = probs[contra_idx]
-
-            # 阈值判定：只有置信度够高才输出信号，减少噪声
-            if entail_prob > 0.7:
-                verification_signals.append(f"✅ Fact Verified: {fact[:60]}... (Conf: {entail_prob:.1%})")
-            elif contra_prob > 0.7:
-                verification_signals.append(f"❌ Conflict Detected: {fact[:60]}... (Conf: {contra_prob:.1%})")
-
-        return verification_signals
+    # def _verify_evidence(self, sub_table_facts: List[str], text_evidence: str) -> List[str]:
+    #     """
+    #     利用 Tokenizer 的 Batch 处理能力，一次性校验所有表格事实
+    #     """
+    #     if not text_evidence or not sub_table_facts:
+    #         return []
+    #
+    #     verification_signals = []
+    #     # 将文本证据作为统一的前提 (Premise)
+    #     premise = text_evidence[:1500]
+    #
+    #     try:
+    #         entail_idx = self.nli_labels.index("entailment")
+    #         contra_idx = self.nli_labels.index("contradiction")
+    #     except ValueError:
+    #         # 兜底逻辑：如果 labels 设置不对，默认使用官方标准 0, 2
+    #         entail_idx, contra_idx = 0, 2
+    #
+    #     # 1. 构造 Batch 输入对：[[Premise, Hypo1], [Premise, Hypo2], ...]
+    #     pairs = [[premise, fact] for fact in sub_table_facts]
+    #
+    #     # 2. 调用 Tokenizer 的批处理功能
+    #     # padding=True 会自动对齐长度，return_tensors="pt" 返回 PyTorch 张量
+    #     inputs = self.nli_tokenizer(
+    #         pairs,
+    #         padding=True,
+    #         truncation=True,
+    #         max_length=512,
+    #         return_tensors="pt"
+    #     ).to(self.device)
+    #
+    #     # 3. 开启无梯度推理模式
+    #     with torch.no_grad():
+    #         outputs = self.nli_model(**inputs)
+    #         # 对 logits 在最后一个维度（标签维度）做 Softmax，得到概率分布 [Batch_size, 3]
+    #         predictions = torch.softmax(outputs.logits, dim=-1)
+    #
+    #     # 4. 解析结果 (对应官方标签顺序: entailment, neutral, contradiction)
+    #     # 将结果转回 CPU 列表处理
+    #     predictions = predictions.cpu().numpy()
+    #
+    #     for i, probs in enumerate(predictions):
+    #         fact = sub_table_facts[i]
+    #         entail_prob = probs[entail_idx]
+    #         contra_prob = probs[contra_idx]
+    #
+    #         # 阈值判定：只有置信度够高才输出信号，减少噪声
+    #         if entail_prob > 0.7:
+    #             verification_signals.append(f"✅ Fact Verified: {fact[:60]}... (Conf: {entail_prob:.1%})")
+    #         elif contra_prob > 0.7:
+    #             verification_signals.append(f"❌ Conflict Detected: {fact[:60]}... (Conf: {contra_prob:.1%})")
+    #
+    #     return verification_signals
 
     def retrieve_aligned_context(self, question: str):
         """
@@ -454,13 +545,33 @@ Output JSON only:
         """
         print(f"\n=== 🚀 Hybrid Query: {question} ===")
         query_emb_numpy = self.embedder.encode(question)
-        query_emb = torch.tensor(query_emb_numpy).squeeze()
+        query_emb = torch.tensor(query_emb_numpy).squeeze().cpu()
 
         # 1. 意图分析与锚点检索
         intent = self._analyze_query_intent(question)
         anchor_ids = self._get_top_k_indices(query_emb, self.table_embeddings, top_k=10)
         anchor_entities = [self.df.iloc[rid][self.pk_col] for rid in anchor_ids]
         expanded_ids = self._expand_context_radius(anchor_ids, intent)
+
+        # 关键词检测：如果问题包含排序、最值、计数等词汇
+        ranking_keywords = ["most", "least", "best", "worst", "top", "first", "second", "third", "last", "rank", "sort",
+                            "highest", "lowest"]
+        is_ranking_query = any(kw in question.lower() for kw in ranking_keywords)
+
+        if is_ranking_query or intent == "ranking" or intent == "aggregation":
+            print(f"📊 Detected Ranking/Aggregation Query: Preserving Table Structure...")
+            # 策略 A：如果是小表 (50行以内)，干脆全给，不要让 LLM 猜
+            if len(self.df) <= 50:
+                expanded_ids = list(range(len(self.df)))
+            # 策略 B：如果是大表，强制钉死前 10 行 (Pin Top-N)
+            # 这样 LLM 就能看到 Rank 1, 2, 3... 从而建立正确的坐标系
+            else:
+                top_rows_count = 10
+                # 确保不超过表长度
+                top_ids = [i for i in range(min(top_rows_count, len(self.df)))]
+                # 合并 语义检索行 + 头部行
+                expanded_ids = sorted(list(set(expanded_ids + top_ids)))
+        expanded_ids.sort()
 
         # 3.  构建精简子表
         col_info = self._filter_columns(question)
@@ -477,7 +588,7 @@ Output JSON only:
         pruned_text_str = ""
 
         if self.text_embeddings is not None:
-            top_text_ids = self._get_top_k_indices(query_emb, self.text_embeddings, top_k=20)
+            top_text_ids = self._get_top_k_indices(query_emb, self.text_embeddings, top_k=30)
             candidate_texts = [self.raw_text_list[i] for i in top_text_ids]
             # 交给 pruning 函数做最后的内容精简 (取 Top 50%)
             pruned_units = self._retrieve_and_prune_text(query_emb, anchor_entities, candidate_texts)
@@ -522,8 +633,10 @@ Output JSON only:
     {pruned_text_str}
     - Question: {question}
     
-PLEASE OUTPUT WITH THE FOLLOWING FORMAT:
-<Answer>: direct answer
+Please format your output EXACTLY as follows:
+{{
+<Answer>: [The direct answer]
+}}
     """
 
         print("\n📝 [Final Prompt Context Preview]:")

@@ -57,7 +57,7 @@ class SemanticRetriever :
         self.index_lock = threading.RLock()
 
         print("embedding size", doc_embeddings.shape)
-        self.res = faiss.StandardGpuResources()
+        # self.res = faiss.StandardGpuResources()
         self.index_IP = self.build_index(doc_embeddings)
 
     def embed_doc(self, chunks: List[str], batch_size: int = 512, save_path: str = None) -> Any :
@@ -136,7 +136,7 @@ class SemanticRetriever :
         with self.index_lock :
             _, dim = dense_vector.shape
             index_IP = faiss.IndexFlatIP(dim)
-            co = faiss.GpuClonerOptions()
+            # co = faiss.GpuClonerOptions()
 
             # make it to gpu index
             # index_gpu = faiss.index_cpu_to_gpu(provider=self.res, device=2, index=index_IP, options=co)

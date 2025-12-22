@@ -185,7 +185,8 @@ if __name__ == "__main__":
     # Example usage
     system_prompt = "You are a helpful assistant."
     user_prompt = "What is the capital of France?"
-    model = "qwen2.5:32b"
+    model = "qwen2.5:7b"
+    # model = "qwen2.5:32b"
     # model = "qwen2.5:72b"
 
     response = get_llm_response(system_prompt, user_prompt, model)
