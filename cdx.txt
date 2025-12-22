@@ -36,6 +36,7 @@ export CUDA_VISIBLE_DEVICES=3
 conda activate TableRAG
 cd ~/workspace/TableRAG/online_inference
  python main.py   --backbone qwen2.5:7b  --data_file_path ./data/1.json  --doc_dir ./data/dev_doc  --excel_dir ./data/dev_excel --bge_dir ./models --save_file_path ./output.json
+ python main.py   --backbone qwen2.5:7b  --data_file_path ./data/my_dev.json  --doc_dir ./data/dev_doc  --excel_dir ./data/dev_excel --bge_dir ./models --save_file_path ./output.json
  python main.py   --backbone qwen2.5:32b  --data_file_path ./data/my_dev.json  --doc_dir ./data/dev_doc  --excel_dir ./data/dev_excel --bge_dir ./models --save_file_path ./output.json
  python main.py   --backbone qwen2.5:72b  --data_file_path ./data/my_dev.json  --doc_dir ./data/dev_doc  --excel_dir ./data/dev_excel --bge_dir ./models --save_file_path ./output.json
 

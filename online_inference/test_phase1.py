@@ -33,14 +33,14 @@ def main(table_id, questions):
 
 
 if __name__ == "__main__":
-    question1 = "Of the free and open source software browsers, which is currently on stable version 10?"
-    question2 = "What engine does the Blackberry Browser use?"
-    table_id = "Mobile_browser_0"
-    questions = [question1,question2]
+    # question1 = "Of the free and open source software browsers, which is currently on stable version 10?"
+    # question2 = "What engine does the Blackberry Browser use?"
+    # table_id = "Mobile_browser_0"
+    # questions = [question1,question2]
 
-    # question = "What is the middle name of the player with the second most National Football League career rushing yards ?"
-    # table_id = "List_of_National_Football_League_rushing_yards_leaders_0"
-    # #  "answer-text": "Jerry"
-    # questions = [question]
+    question = "What is the middle name of the player with the second most National Football League career rushing yards ?"
+    table_id = "List_of_National_Football_League_rushing_yards_leaders_0"
+    #  "answer-text": "Jerry"
+    questions = [question]
 
     main(table_id, questions)

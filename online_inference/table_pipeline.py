@@ -245,8 +245,7 @@ Critical constraints:
 Output JSON only:
 {{
   "selected_columns": ["<exact column name>", ...],
-  "answer_in_table": true/false,
-  "reasoning": "<brief explanation>"
+  "answer_in_table": true/false
 }}
     """
         formatted_prompt = prompt.format(question=question, columns=', '.join(all_cols))
@@ -271,7 +270,6 @@ Output JSON only:
             final_selected = all_cols
 
         print(f"🏷️ answer_in_table: {result['answer_in_table']}")
-        print(f"💡 Reasoning: {result['reasoning']}")
         result["selected_columns"] = final_selected
         return result
 
