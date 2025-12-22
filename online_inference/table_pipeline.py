@@ -325,26 +325,35 @@ Output JSON only:
 
         return sorted_ids[:limit]
 
-    # =========================================================================
-    # 文本侧精简 (Textual Pruning - KV Focused)
-    # =========================================================================
-
     def _retrieve_and_prune_text(self, query_emb: torch.Tensor, anchor_entities: List[str],
                                  retrieved_texts: List[str]) -> List[Dict]:
         """
-        2. 自动判定 KV 结构与句子结构
-        3. 基于 BGE 相似度与实体锚定打分
+        [Text Pruning] 双路召回版 (Dual-Route Retrieval)
+        为了防止加权策略导致的“逆反”，我们采用分路录取策略：
+        1. 语义通道：录取向量相似度最高的文本。
+        2. 词汇通道：录取实体关键词匹配度最高的文本。
+        最后取并集。
         """
         if not retrieved_texts: return []
 
-        entity_keywords = set()
+        # --- 1. 准备 IDF 权重 (用于词汇通道) ---
+        # 统计 anchor 实体的词频，计算简易 IDF
+        all_anchor_tokens = []
         for ent in anchor_entities:
-            for word in re.split(r'\W+', ent):  # 按非字母字符拆分
-                if len(word) > 3:  entity_keywords.add(word.lower())
+            tokens = [w.lower() for w in re.split(r'\W+', str(ent)) if len(w) > 2]
+            all_anchor_tokens.extend(tokens)
 
-        seen_units = set()  # 用于去重
+        token_counts = Counter(all_anchor_tokens)
+        num_anchors = max(1, len(anchor_entities))
+
+        idf_weights = {}
+        for token, count in token_counts.items():
+            # 越稀有的实体词，权重越大
+            idf_weights[token] = math.log(num_anchors / (count + 1)) + 1.0
+
+        # --- 2. 文本预处理与去重 ---
+        seen_units = set()
         for text in retrieved_texts:
-            # 自动判定 KV vs 纯文本结构
             is_kv = len(re.findall(r'[:：|]', text)) > len(text) / 50
             units = re.split(r'[\n;]', text) if is_kv else re.split(r'(?<=[。？！?.])\s+', text)
             for u in units:
@@ -353,36 +362,141 @@ Output JSON only:
                     seen_units.add(u_clean)
 
         unique_units = list(seen_units)
-        if not seen_units: return []
+        if not unique_units: return []
 
-        # 向量化 (增加手动归一化，确保后续计算准确)
-        # raw_embs: [N, Dim]
+        # --- 3. 向量化 (语义通道) ---
         raw_embs = torch.tensor(self.embedder.encode(unique_units))
         unit_embs = torch.nn.functional.normalize(raw_embs, p=2, dim=1)
-        # 打分 (Query vs Units)
-        if query_emb.dim() == 1:
-            scores = torch.matmul(unit_embs, query_emb)
-        else:
-            scores = torch.matmul(unit_embs, query_emb.t()).squeeze()
-        scores = scores.cpu().numpy()
 
-        all_units = []
-        for i, score in enumerate(scores):
-            text_unit = unique_units[i]
-            # 关键词加分
-            if any(kw in text_unit.lower() for kw in entity_keywords):
-                score += 0.2
-            all_units.append({
+        if query_emb.dim() == 1:
+            dense_scores = torch.matmul(unit_embs, query_emb).cpu().numpy()
+        else:
+            dense_scores = torch.matmul(unit_embs, query_emb.t()).squeeze().cpu().numpy()
+
+        # --- 4. 评分计算 ---
+        scored_units = []
+        for i, text_unit in enumerate(unique_units):
+            d_score = dense_scores[i]  # 语义分
+            text_lower = text_unit.lower()
+
+            # 计算词汇分 (Lexical Score)
+            s_score = 0.0
+            for token, weight in idf_weights.items():
+                if token in text_lower:
+                    s_score += weight
+
+            scored_units.append({
                 "text": text_unit,
-                "score": score,
-                "embedding": unit_embs[i]  # 带出向量，供下一步对齐使用
+                "embedding": unit_embs[i],
+                "dense_score": d_score,
+                "sparse_score": s_score,
+                "original_index": i
             })
 
-        # 保留前 50%
-        all_units.sort(key=lambda x: x["score"], reverse=True)
-        keep_count = min(80, math.ceil(len(all_units) * 0.5))  # 稍微放宽一点上限到，保证上下文
+        # --- 5. 双路录取 (Dual Selection) ---
 
-        return all_units[:keep_count]
+        # 预算分配：总共留 35~50 个
+        # 语义通道占 70%，词汇通道占 30% (保证语义是主流，关键词是补充)
+        total_budget = min(50, math.ceil(len(scored_units) * 0.6))
+        total_budget = max(25, total_budget)  # 至少留 25 个
+
+        semantic_budget = int(total_budget * 0.7)
+        lexical_budget = total_budget - semantic_budget
+
+        final_indices = set()
+
+        # Route A: 语义优先 (Vector High Score)
+        scored_units.sort(key=lambda x: x["dense_score"], reverse=True)
+        for i in range(min(len(scored_units), semantic_budget)):
+            final_indices.add(scored_units[i]["original_index"])
+
+        # Route B: 词汇优先 (Keyword High Score)
+        # 重新排序，这次看 sparse_score
+        scored_units.sort(key=lambda x: x["sparse_score"], reverse=True)
+
+        # 录取那些还没有被语义通道选中的“漏网之鱼”
+        added_count = 0
+        for unit in scored_units:
+            if added_count >= lexical_budget:
+                break
+            if unit["original_index"] not in final_indices:
+                # 只有当它确实包含关键词 (sparse_score > 0) 时才救回
+                if unit["sparse_score"] > 0:
+                    final_indices.add(unit["original_index"])
+                    added_count += 1
+
+        # --- 6. 组装最终结果 ---
+        # 按照原始的语义分数排序输出，保证后续处理顺序正常
+        final_result = []
+        for i in range(len(unique_units)):
+            if i in final_indices:
+                # 找到对应的分数对象
+                # 为了后续兼容，我们把 score 设为 dense_score，因为对齐阶段会重新算
+                unit_obj = next(u for u in scored_units if u["original_index"] == i)
+                final_result.append({
+                    "text": unit_obj["text"],
+                    "score": unit_obj["dense_score"],  # 保持 API 兼容
+                    "embedding": unit_obj["embedding"]
+                })
+
+        # 再次按分数排序返回
+        final_result.sort(key=lambda x: x["score"], reverse=True)
+        return final_result
+
+    # def _retrieve_and_prune_text(self, query_emb: torch.Tensor, anchor_entities: List[str],
+    #                              retrieved_texts: List[str]) -> List[Dict]:
+    #     """
+    #     2. 自动判定 KV 结构与句子结构
+    #     3. 基于 BGE 相似度与实体锚定打分
+    #     """
+    #     if not retrieved_texts: return []
+    #
+    #     entity_keywords = set()
+    #     for ent in anchor_entities:
+    #         for word in re.split(r'\W+', ent):  # 按非字母字符拆分
+    #             if len(word) > 3:  entity_keywords.add(word.lower())
+    #
+    #     seen_units = set()  # 用于去重
+    #     for text in retrieved_texts:
+    #         # 自动判定 KV vs 纯文本结构
+    #         is_kv = len(re.findall(r'[:：|]', text)) > len(text) / 50
+    #         units = re.split(r'[\n;]', text) if is_kv else re.split(r'(?<=[。？！?.])\s+', text)
+    #         for u in units:
+    #             u_clean = u.strip()
+    #             if len(u_clean) > 5 and u_clean not in seen_units:
+    #                 seen_units.add(u_clean)
+    #
+    #     unique_units = list(seen_units)
+    #     if not seen_units: return []
+    #
+    #     # 向量化 (增加手动归一化，确保后续计算准确)
+    #     # raw_embs: [N, Dim]
+    #     raw_embs = torch.tensor(self.embedder.encode(unique_units))
+    #     unit_embs = torch.nn.functional.normalize(raw_embs, p=2, dim=1)
+    #     # 打分 (Query vs Units)
+    #     if query_emb.dim() == 1:
+    #         scores = torch.matmul(unit_embs, query_emb)
+    #     else:
+    #         scores = torch.matmul(unit_embs, query_emb.t()).squeeze()
+    #     scores = scores.cpu().numpy()
+    #
+    #     all_units = []
+    #     for i, score in enumerate(scores):
+    #         text_unit = unique_units[i]
+    #         # 关键词加分
+    #         if any(kw in text_unit.lower() for kw in entity_keywords):
+    #             score += 0.2
+    #         all_units.append({
+    #             "text": text_unit,
+    #             "score": score,
+    #             "embedding": unit_embs[i]  # 带出向量，供下一步对齐使用
+    #         })
+    #
+    #     # 保留前 50%
+    #     all_units.sort(key=lambda x: x["score"], reverse=True)
+    #     keep_count = min(80, math.ceil(len(all_units) * 0.5))  # 稍微放宽一点上限到，保证上下文
+    #
+    #     return all_units[:keep_count]
 
     def _inject_cross_references(self, sub_df: pd.DataFrame, pruned_units: List[Dict]) -> Dict[str, str]:
         """
@@ -590,7 +704,7 @@ Output JSON only:
         if self.text_embeddings is not None:
             top_text_ids = self._get_top_k_indices(query_emb, self.text_embeddings, top_k=30)
             candidate_texts = [self.raw_text_list[i] for i in top_text_ids]
-            # 交给 pruning 函数做最后的内容精简 (取 Top 50%)
+            # 交给 pruning 函数做最后的内容精简
             pruned_units = self._retrieve_and_prune_text(query_emb, anchor_entities, candidate_texts)
 
             # 注入引用信息,利用上一步的向量做表文对齐
