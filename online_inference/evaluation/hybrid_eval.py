@@ -64,7 +64,7 @@ def single_llm_eval(case: Dict = None):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="entry args")
-    parser.add_argument('--backbone', type=str, default="qwen2.5:72b")
+    parser.add_argument('--backbone', type=str, default="qwen3-max-preview")
     parser.add_argument('--result_file_path', type=str,
                         default=r"../output.json", help="source file path")
     _args, _unparsed = parser.parse_known_args()

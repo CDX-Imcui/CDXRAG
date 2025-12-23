@@ -11,9 +11,9 @@ config_mapping = {
         "model": "qwen2.5-72b-instruct",
         "api_key": "sk-1c406031a3e1468c8d734e44e03bcf0e"
     },
-    "qwen3-max": {
+    "qwen3-max-preview": {
         "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "model": "qwen3-max",
+        "model": "qwen3-max-preview",
         "api_key": "sk-1c406031a3e1468c8d734e44e03bcf0e"
     },
     "qwen2.5:7b": {
